@@ -1,0 +1,45 @@
+name: neon-local
+
+services:
+  neon:
+    build:
+      context: .
+      dockerfile: docker/local/Dockerfile
+      args:
+        DEV_UID: "1000"
+        DEV_GID: "1000"
+    image: neon-local-dev:8f60b04
+    init: true
+    working_dir: /workspace/neon
+    environment:
+      NEON_BUILD_JOBS: "8"
+      CARGO_HOME: /home/neon/.cargo
+      CARGO_TARGET_DIR: /workspace/neon/target
+      RUST_BACKTRACE: "1"
+    volumes:
+      - .:/workspace/neon
+      - neon-data:/workspace/neon/.neon
+      - cargo-cache:/home/neon/.cargo
+      - cargo-target:/workspace/neon/target
+      - pg-install:/workspace/neon/pg_install
+    ports:
+      - "127.0.0.1:55432:55432"
+    cpus: 8
+    mem_limit: 16g
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 55432 -U cloud_admin -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  neon-data:
+    name: neon-local-data
+  cargo-cache:
+    name: neon-local-cargo-cache
+  cargo-target:
+    name: neon-local-cargo-target
+  pg-install:
+    name: neon-local-pg-install
