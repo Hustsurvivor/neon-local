@@ -236,6 +236,7 @@ impl PagestreamReceiver {
             PagestreamBeMessage::Error(e) => anyhow::bail!("Error: {:?}", e),
             PagestreamBeMessage::Exists(_)
             | PagestreamBeMessage::Nblocks(_)
+            | PagestreamBeMessage::GetPageShared(_)
             | PagestreamBeMessage::DbSize(_)
             | PagestreamBeMessage::GetSlruSegment(_) => {
                 anyhow::bail!(

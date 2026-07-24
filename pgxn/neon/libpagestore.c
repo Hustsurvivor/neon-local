@@ -39,6 +39,7 @@
 #include "neon_perf_counters.h"
 #include "neon_utils.h"
 #include "pagestore_client.h"
+#include "cxl_cache.h"
 #include "walproposer.h"
 
 #ifdef __linux__
@@ -686,6 +687,9 @@ pageserver_connect(shardno_t shard_no, int elevel)
 
 		switch (neon_protocol_version)
 		{
+		case 4:
+			pagestream_query = psprintf("pagestream_v4 %s %s", neon_tenant, neon_timeline);
+			break;
 		case 3:
 			pagestream_query = psprintf("pagestream_v3 %s %s", neon_tenant, neon_timeline);
 			break;
@@ -1583,10 +1587,11 @@ pg_init_libpagestore(void)
 							&neon_protocol_version,
 							3,	/* use protocol version 3 */
 							2,	/* min */
-							3,	/* max */
+							4,	/* max */
 							PGC_SU_BACKEND,
 							0,	/* no flags required */
 							NULL, NULL, NULL);
+	neon_cxl_cache_init_gucs();
 	DefineCustomIntVariable("hadron.conf_refresh_reconnect_attempt_threshold",
 							"Threshold of the number of consecutive failed pageserver "
 							"connection attempts (per shard) before signaling "

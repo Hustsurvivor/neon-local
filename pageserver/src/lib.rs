@@ -8,6 +8,7 @@ pub mod config;
 pub mod consumption_metrics;
 pub mod context;
 pub mod controller_upcall_client;
+pub mod cxl_cache;
 pub mod deletion_queue;
 pub mod disk_usage_eviction_task;
 pub mod feature_resolver;

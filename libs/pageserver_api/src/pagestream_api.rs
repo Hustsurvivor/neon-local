@@ -35,6 +35,7 @@ pub enum PagestreamBeMessage {
     Exists(PagestreamExistsResponse),
     Nblocks(PagestreamNblocksResponse),
     GetPage(PagestreamGetPageResponse),
+    GetPageShared(PagestreamGetPageSharedResponse),
     Error(PagestreamErrorResponse),
     DbSize(PagestreamDbSizeResponse),
     GetSlruSegment(PagestreamGetSlruSegmentResponse),
@@ -65,6 +66,7 @@ enum PagestreamBeMessageTag {
     Error = 103,
     DbSize = 104,
     GetSlruSegment = 105,
+    GetPageShared = 106,
     /* future tags above this line */
     /// For testing purposes, not available in production.
     #[cfg(feature = "testing")]
@@ -97,6 +99,7 @@ impl TryFrom<u8> for PagestreamBeMessageTag {
             103 => Ok(PagestreamBeMessageTag::Error),
             104 => Ok(PagestreamBeMessageTag::DbSize),
             105 => Ok(PagestreamBeMessageTag::GetSlruSegment),
+            106 => Ok(PagestreamBeMessageTag::GetPageShared),
             #[cfg(feature = "testing")]
             199 => Ok(PagestreamBeMessageTag::Test),
             _ => Err(value),
@@ -137,7 +140,10 @@ impl TryFrom<u8> for PagestreamBeMessageTag {
 pub enum PagestreamProtocolVersion {
     V2,
     V3,
+    V4,
 }
+
+pub const GETPAGE_FLAG_ALLOW_SHARED: u8 = 0x01;
 
 pub type RequestId = u64;
 
@@ -165,6 +171,7 @@ pub struct PagestreamGetPageRequest {
     pub hdr: PagestreamRequest,
     pub rel: RelTag,
     pub blkno: u32,
+    pub flags: u8,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -196,6 +203,25 @@ pub struct PagestreamNblocksResponse {
 pub struct PagestreamGetPageResponse {
     pub req: PagestreamGetPageRequest,
     pub page: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagestreamSharedPageLocation {
+    pub pool_uuid: [u8; 16],
+    pub pool_epoch: u64,
+    pub region_id: u32,
+    pub region_epoch: u64,
+    pub slot_id: u64,
+    pub expected_control: u64,
+    pub absolute_offset: u64,
+    pub length: u32,
+    pub checksum_crc32c: u32,
+}
+
+#[derive(Debug)]
+pub struct PagestreamGetPageSharedResponse {
+    pub req: PagestreamGetPageRequest,
+    pub location: PagestreamSharedPageLocation,
 }
 
 #[derive(Debug)]
@@ -234,6 +260,10 @@ impl PagestreamFeMessage {
     /// Serialize a compute -> pageserver message. This is currently only used in testing
     /// tools. Always uses protocol version 3.
     pub fn serialize(&self) -> Bytes {
+        self.serialize_for_version(PagestreamProtocolVersion::V3)
+    }
+
+    pub fn serialize_for_version(&self, protocol_version: PagestreamProtocolVersion) -> Bytes {
         let mut bytes = BytesMut::new();
 
         match self {
@@ -269,6 +299,9 @@ impl PagestreamFeMessage {
                 bytes.put_u32(req.rel.relnode);
                 bytes.put_u8(req.rel.forknum);
                 bytes.put_u32(req.blkno);
+                if matches!(protocol_version, PagestreamProtocolVersion::V4) {
+                    bytes.put_u8(req.flags);
+                }
             }
 
             Self::DbSize(req) => {
@@ -318,7 +351,7 @@ impl PagestreamFeMessage {
                 Lsn::from(body.read_u64::<BigEndian>()?),
                 Lsn::from(body.read_u64::<BigEndian>()?),
             ),
-            PagestreamProtocolVersion::V3 => (
+            PagestreamProtocolVersion::V3 | PagestreamProtocolVersion::V4 => (
                 body.read_u64::<BigEndian>()?,
                 Lsn::from(body.read_u64::<BigEndian>()?),
                 Lsn::from(body.read_u64::<BigEndian>()?),
@@ -372,6 +405,11 @@ impl PagestreamFeMessage {
                         forknum: body.read_u8()?,
                     },
                     blkno: body.read_u32::<BigEndian>()?,
+                    flags: if matches!(protocol_version, PagestreamProtocolVersion::V4) {
+                        body.read_u8()?
+                    } else {
+                        0
+                    },
                 }))
             }
             PagestreamFeMessageTag::DbSize => {
@@ -437,6 +475,10 @@ impl PagestreamBeMessage {
                         bytes.put(&resp.page[..])
                     }
 
+                    Self::GetPageShared(_) => {
+                        unreachable!("shared page responses require pagestream V4")
+                    }
+
                     Self::Error(resp) => {
                         bytes.put_u8(Tag::Error as u8);
                         bytes.put(resp.message.as_bytes());
@@ -463,7 +505,7 @@ impl PagestreamBeMessage {
                     }
                 }
             }
-            PagestreamProtocolVersion::V3 => {
+            PagestreamProtocolVersion::V3 | PagestreamProtocolVersion::V4 => {
                 match self {
                     Self::Exists(resp) => {
                         bytes.put_u8(Tag::Exists as u8);
@@ -499,7 +541,33 @@ impl PagestreamBeMessage {
                         bytes.put_u32(resp.req.rel.relnode);
                         bytes.put_u8(resp.req.rel.forknum);
                         bytes.put_u32(resp.req.blkno);
+                        if matches!(protocol_version, PagestreamProtocolVersion::V4) {
+                            bytes.put_u8(resp.req.flags);
+                        }
                         bytes.put(&resp.page[..])
+                    }
+
+                    Self::GetPageShared(resp) => {
+                        assert!(matches!(protocol_version, PagestreamProtocolVersion::V4));
+                        bytes.put_u8(Tag::GetPageShared as u8);
+                        bytes.put_u64(resp.req.hdr.reqid);
+                        bytes.put_u64(resp.req.hdr.request_lsn.0);
+                        bytes.put_u64(resp.req.hdr.not_modified_since.0);
+                        bytes.put_u32(resp.req.rel.spcnode);
+                        bytes.put_u32(resp.req.rel.dbnode);
+                        bytes.put_u32(resp.req.rel.relnode);
+                        bytes.put_u8(resp.req.rel.forknum);
+                        bytes.put_u32(resp.req.blkno);
+                        bytes.put_u8(resp.req.flags);
+                        bytes.put_slice(&resp.location.pool_uuid);
+                        bytes.put_u64(resp.location.pool_epoch);
+                        bytes.put_u32(resp.location.region_id);
+                        bytes.put_u64(resp.location.region_epoch);
+                        bytes.put_u64(resp.location.slot_id);
+                        bytes.put_u64(resp.location.expected_control);
+                        bytes.put_u64(resp.location.absolute_offset);
+                        bytes.put_u32(resp.location.length);
+                        bytes.put_u32(resp.location.checksum_crc32c);
                     }
 
                     Self::Error(resp) => {
@@ -622,8 +690,47 @@ impl PagestreamBeMessage {
                             },
                             rel,
                             blkno,
+                            flags: 0,
                         },
                         page: page.into(),
+                    })
+                }
+                Tag::GetPageShared => {
+                    let reqid = buf.read_u64::<BigEndian>()?;
+                    let request_lsn = Lsn(buf.read_u64::<BigEndian>()?);
+                    let not_modified_since = Lsn(buf.read_u64::<BigEndian>()?);
+                    let rel = RelTag {
+                        spcnode: buf.read_u32::<BigEndian>()?,
+                        dbnode: buf.read_u32::<BigEndian>()?,
+                        relnode: buf.read_u32::<BigEndian>()?,
+                        forknum: buf.read_u8()?,
+                    };
+                    let blkno = buf.read_u32::<BigEndian>()?;
+                    let flags = buf.read_u8()?;
+                    let mut pool_uuid = [0u8; 16];
+                    buf.read_exact(&mut pool_uuid)?;
+                    Self::GetPageShared(PagestreamGetPageSharedResponse {
+                        req: PagestreamGetPageRequest {
+                            hdr: PagestreamRequest {
+                                reqid,
+                                request_lsn,
+                                not_modified_since,
+                            },
+                            rel,
+                            blkno,
+                            flags,
+                        },
+                        location: PagestreamSharedPageLocation {
+                            pool_uuid,
+                            pool_epoch: buf.read_u64::<BigEndian>()?,
+                            region_id: buf.read_u32::<BigEndian>()?,
+                            region_epoch: buf.read_u64::<BigEndian>()?,
+                            slot_id: buf.read_u64::<BigEndian>()?,
+                            expected_control: buf.read_u64::<BigEndian>()?,
+                            absolute_offset: buf.read_u64::<BigEndian>()?,
+                            length: buf.read_u32::<BigEndian>()?,
+                            checksum_crc32c: buf.read_u32::<BigEndian>()?,
+                        },
                     })
                 }
                 Tag::Error => {
@@ -721,6 +828,7 @@ impl PagestreamBeMessage {
             Self::Exists(_) => "Exists",
             Self::Nblocks(_) => "Nblocks",
             Self::GetPage(_) => "GetPage",
+            Self::GetPageShared(_) => "GetPageShared",
             Self::Error(_) => "Error",
             Self::DbSize(_) => "DbSize",
             Self::GetSlruSegment(_) => "GetSlruSegment",
@@ -777,6 +885,7 @@ mod tests {
                     relnode: 4,
                 },
                 blkno: 7,
+                flags: 0,
             }),
             PagestreamFeMessage::DbSize(PagestreamDbSizeRequest {
                 hdr: PagestreamRequest {
@@ -794,5 +903,72 @@ mod tests {
                     .unwrap();
             assert!(msg == reconstructed);
         }
+    }
+
+    #[test]
+    fn test_pagestream_v4_getpage_request_flags() {
+        let message = PagestreamFeMessage::GetPage(PagestreamGetPageRequest {
+            hdr: PagestreamRequest {
+                reqid: 42,
+                request_lsn: Lsn(100),
+                not_modified_since: Lsn(90),
+            },
+            rel: RelTag {
+                forknum: 0,
+                spcnode: 1,
+                dbnode: 2,
+                relnode: 3,
+            },
+            blkno: 7,
+            flags: GETPAGE_FLAG_ALLOW_SHARED,
+        });
+
+        let bytes = message.serialize_for_version(PagestreamProtocolVersion::V4);
+        let reconstructed =
+            PagestreamFeMessage::parse(&mut bytes.reader(), PagestreamProtocolVersion::V4).unwrap();
+        assert_eq!(message, reconstructed);
+    }
+
+    #[test]
+    fn test_pagestream_v4_shared_page_response() {
+        let response = PagestreamBeMessage::GetPageShared(PagestreamGetPageSharedResponse {
+            req: PagestreamGetPageRequest {
+                hdr: PagestreamRequest {
+                    reqid: 42,
+                    request_lsn: Lsn(100),
+                    not_modified_since: Lsn(90),
+                },
+                rel: RelTag {
+                    forknum: 0,
+                    spcnode: 1,
+                    dbnode: 2,
+                    relnode: 3,
+                },
+                blkno: 7,
+                flags: GETPAGE_FLAG_ALLOW_SHARED,
+            },
+            location: PagestreamSharedPageLocation {
+                pool_uuid: [0xAB; 16],
+                pool_epoch: 11,
+                region_id: 1,
+                region_epoch: 12,
+                slot_id: 13,
+                expected_control: 14,
+                absolute_offset: 15,
+                length: 8192,
+                checksum_crc32c: 16,
+            },
+        });
+
+        let bytes = response.serialize(PagestreamProtocolVersion::V4);
+        let reconstructed = PagestreamBeMessage::deserialize(bytes).unwrap();
+        let PagestreamBeMessage::GetPageShared(reconstructed) = reconstructed else {
+            panic!("expected shared page response");
+        };
+        assert_eq!(reconstructed.req.flags, GETPAGE_FLAG_ALLOW_SHARED);
+        assert_eq!(reconstructed.location.pool_uuid, [0xAB; 16]);
+        assert_eq!(reconstructed.location.region_id, 1);
+        assert_eq!(reconstructed.location.slot_id, 13);
+        assert_eq!(reconstructed.location.length, 8192);
     }
 }

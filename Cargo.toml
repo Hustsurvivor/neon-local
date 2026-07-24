@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "cxl-cache",
     "compute_tools",
     "control_plane",
     "control_plane/storcon_cli",
@@ -262,6 +263,7 @@ endpoint_storage = { version = "0.0.1", path = "./endpoint_storage/" }
 http-utils = { version = "0.1", path = "./libs/http-utils/" }
 metrics = { version = "0.1", path = "./libs/metrics/" }
 neon-shmem = { version = "0.1", path = "./libs/neon-shmem/" }
+neon-cxl-cache = { version = "0.1", path = "./cxl-cache/" }
 pageserver = { path = "./pageserver" }
 pageserver_api = { version = "0.1", path = "./libs/pageserver_api/" }
 pageserver_client = { path = "./pageserver/client" }

@@ -16,6 +16,8 @@ services:
       CARGO_HOME: /home/neon/.cargo
       CARGO_TARGET_DIR: /workspace/neon/target
       RUST_BACKTRACE: "1"
+      NEON_CXL_CACHE_POOL_FILE: /workspace/neon/.neon/cxl-cache/pool.bin
+      NEON_CXL_CACHE_DAEMON_SOCKET: /workspace/neon/.neon/cxl-cache/daemon.sock
     volumes:
       - .:/workspace/neon
       - neon-data:/workspace/neon/.neon

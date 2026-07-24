@@ -217,6 +217,9 @@ fn main() -> anyhow::Result<()> {
     );
     tracing::info!("Initializing page_cache...");
     page_cache::init(conf.page_cache_size);
+    if let Err(error) = pageserver::cxl_cache::init_from_env(conf.id) {
+        tracing::warn!(%error, "CXL shared cache is disabled");
+    }
 
     start_pageserver(launch_ts, conf, ignored, otel_guard).context("Failed to start pageserver")?;
 

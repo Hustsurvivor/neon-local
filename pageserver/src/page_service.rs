@@ -28,9 +28,10 @@ use pageserver_api::config::{
 use pageserver_api::key::rel_block_to_key;
 use pageserver_api::models::{PageTraceEvent, TenantState};
 use pageserver_api::pagestream_api::{
-    self, PagestreamBeMessage, PagestreamDbSizeRequest, PagestreamDbSizeResponse,
-    PagestreamErrorResponse, PagestreamExistsRequest, PagestreamExistsResponse,
-    PagestreamFeMessage, PagestreamGetPageRequest, PagestreamGetSlruSegmentRequest,
+    self, GETPAGE_FLAG_ALLOW_SHARED, PagestreamBeMessage, PagestreamDbSizeRequest,
+    PagestreamDbSizeResponse, PagestreamErrorResponse, PagestreamExistsRequest,
+    PagestreamExistsResponse, PagestreamFeMessage, PagestreamGetPageRequest,
+    PagestreamGetPageSharedResponse, PagestreamGetSlruSegmentRequest,
     PagestreamGetSlruSegmentResponse, PagestreamNblocksRequest, PagestreamNblocksResponse,
     PagestreamProtocolVersion, PagestreamRequest,
 };
@@ -69,6 +70,7 @@ use crate::config::PageServerConf;
 use crate::context::{
     DownloadBehavior, PerfInstrumentFutureExt, RequestContext, RequestContextBuilder,
 };
+use crate::cxl_cache::{CacheKey as CxlCacheKey, manager as cxl_cache_manager, protocol_location};
 use crate::feature_resolver::FeatureResolver;
 use crate::metrics::{
     self, COMPUTE_COMMANDS_COUNTERS, ComputeCommandKind, GetPageBatchBreakReason, LIVE_CONNECTIONS,
@@ -2536,9 +2538,30 @@ impl PageServerHandler {
             }
         }
 
-        let results = timeline
+        let cached_locations: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                if request.req.flags & GETPAGE_FLAG_ALLOW_SHARED == 0 {
+                    return None;
+                }
+                let key = CxlCacheKey::new(
+                    timeline.tenant_shard_id,
+                    timeline.timeline_id,
+                    request.req.rel,
+                    request.req.blkno,
+                    request.lsn_range.effective_lsn,
+                );
+                cxl_cache_manager()?.lookup(&key)
+            })
+            .collect();
+        let misses: Vec<_> = requests
+            .iter()
+            .zip(&cached_locations)
+            .filter_map(|(request, location)| location.is_none().then_some(request))
+            .collect();
+        let miss_results = timeline
             .get_rel_page_at_lsn_batched(
-                requests.iter().map(|p| {
+                misses.iter().map(|p| {
                     (
                         &p.req.rel,
                         &p.req.blkno,
@@ -2550,22 +2573,62 @@ impl PageServerHandler {
                 &ctx,
             )
             .await;
-        assert_eq!(results.len(), requests.len());
+        assert_eq!(miss_results.len(), misses.len());
+        let mut miss_results = miss_results.into_iter();
 
-        // TODO: avoid creating the new Vec here
         Vec::from_iter(
             requests
                 .into_iter()
-                .zip(results.into_iter())
-                .map(|(req, res)| {
-                    res.map(|page| {
-                        (
-                            PagestreamBeMessage::GetPage(
-                                pagestream_api::PagestreamGetPageResponse { req: req.req, page },
-                            ),
+                .zip(cached_locations)
+                .map(|(req, cached_location)| {
+                    if let Some(location) = cached_location {
+                        return Ok((
+                            PagestreamBeMessage::GetPageShared(PagestreamGetPageSharedResponse {
+                                req: req.req,
+                                location: protocol_location(location),
+                            }),
                             req.timer,
                             req.ctx,
-                        )
+                        ));
+                    }
+
+                    let res = miss_results
+                        .next()
+                        .expect("every cache miss has one reconstruction result");
+                    res.map(|page| {
+                        let key = CxlCacheKey::new(
+                            timeline.tenant_shard_id,
+                            timeline.timeline_id,
+                            req.req.rel,
+                            req.req.blkno,
+                            req.lsn_range.effective_lsn,
+                        );
+                        let location =
+                            cxl_cache_manager().and_then(|manager| manager.publish(key, &page));
+                        let response = if req.req.flags & GETPAGE_FLAG_ALLOW_SHARED != 0 {
+                            location
+                                .map(|location| {
+                                    PagestreamBeMessage::GetPageShared(
+                                        PagestreamGetPageSharedResponse {
+                                            req: req.req,
+                                            location: protocol_location(location),
+                                        },
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    PagestreamBeMessage::GetPage(
+                                        pagestream_api::PagestreamGetPageResponse {
+                                            req: req.req,
+                                            page,
+                                        },
+                                    )
+                                })
+                        } else {
+                            PagestreamBeMessage::GetPage(
+                                pagestream_api::PagestreamGetPageResponse { req: req.req, page },
+                            )
+                        };
+                        (response, req.timer, req.ctx)
                     })
                     .map_err(|e| BatchedPageStreamError {
                         err: PageStreamError::from(e),
@@ -3016,6 +3079,10 @@ impl PageServiceCmd {
                 other,
                 PagestreamProtocolVersion::V3,
             )?)),
+            "pagestream_v4" => Ok(Self::PageStream(PageStreamCmd::parse(
+                other,
+                PagestreamProtocolVersion::V4,
+            )?)),
             "basebackup" => Ok(Self::BaseBackup(BaseBackupCmd::parse(other)?)),
             "fullbackup" => Ok(Self::FullBackup(FullBackupCmd::parse(other)?)),
             "lease" => {
@@ -3176,6 +3243,7 @@ where
                 let command_kind = match protocol_version {
                     PagestreamProtocolVersion::V2 => ComputeCommandKind::PageStreamV2,
                     PagestreamProtocolVersion::V3 => ComputeCommandKind::PageStreamV3,
+                    PagestreamProtocolVersion::V4 => ComputeCommandKind::PageStreamV3,
                 };
                 COMPUTE_COMMANDS_COUNTERS.for_command(command_kind).inc();
 
@@ -3590,6 +3658,7 @@ impl GrpcPageServiceHandler {
                     hdr: Self::make_hdr(req.read_lsn, Some(req.request_id)),
                     rel: req.rel,
                     blkno,
+                    flags: 0,
                 },
                 lsn_range: LsnRange {
                     effective_lsn,

@@ -41,6 +41,7 @@ typedef enum
 	T_NeonErrorResponse,
 	T_NeonDbSizeResponse,
 	T_NeonGetSlruSegmentResponse,
+	T_NeonGetPageSharedResponse,
 	/* future tags above this line */
 	T_NeonTestResponse = 199, /* only in cfg(feature = "testing") */
 } NeonMessageTag;
@@ -119,7 +120,10 @@ typedef struct
 	NRelFileInfo rinfo;
 	ForkNumber	forknum;
 	BlockNumber blkno;
+	uint8		flags;
 } NeonGetPageRequest;
+
+#define NEON_GETPAGE_FLAG_ALLOW_SHARED 0x01
 
 typedef struct
 {
@@ -149,6 +153,14 @@ typedef struct
 	NeonGetPageRequest req;
 	char		page[FLEXIBLE_ARRAY_MEMBER];
 } NeonGetPageResponse;
+
+#include "cxl_cache.h"
+
+typedef struct
+{
+	NeonGetPageRequest req;
+	NeonCxlPageLocation location;
+} NeonGetPageSharedResponse;
 
 #define PS_GETPAGERESPONSE_SIZE (MAXALIGN(offsetof(NeonGetPageResponse, page) + BLCKSZ))
 

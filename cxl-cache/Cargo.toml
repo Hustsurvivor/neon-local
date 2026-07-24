@@ -1,0 +1,22 @@
+[package]
+name = "neon-cxl-cache"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "neon_cxl_cache"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cxl-cache-daemon"
+path = "src/bin/cxl-cache-daemon.rs"
+
+[[bin]]
+name = "cxl-cache-writer"
+path = "src/bin/cxl-cache-writer.rs"
+
+[[bin]]
+name = "cxl-cache-reader"
+path = "src/bin/cxl-cache-reader.rs"

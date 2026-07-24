@@ -178,11 +178,14 @@ typedef enum PrefetchStatus
 								 * valid */
 } PrefetchStatus;
 
-/* must fit in uint8; bits 0x1 are used */
+/* must fit in uint8 */
 typedef enum {
 	PRFSF_NONE	= 0x0,
-	PRFSF_LFC	= 0x1  /* received prefetch result is stored in LFC */
+	PRFSF_LFC	= 0x1, /* received prefetch result is stored in LFC */
+	PRFSF_NO_SHARED = 0x2 /* retry must return page bytes over pagestream */
 } PrefetchRequestFlags;
+
+#define NEON_CXL_FALLBACK_PREFIX "NEON_CXL_FALLBACK: "
 
 typedef struct PrefetchRequest
 {
@@ -294,7 +297,7 @@ static bool compact_prefetch_buffers(void);
 static void consume_prefetch_responses(void);
 static uint64 prefetch_register_bufferv(BufferTag tag, neon_request_lsns *frlsns,
 										BlockNumber nblocks, const bits8 *mask,
-										bool is_prefetch);
+										bool is_prefetch, bool allow_shared);
 static bool prefetch_read(PrefetchRequest *slot);
 static void prefetch_do_request(PrefetchRequest *slot, neon_request_lsns *force_request_lsns);
 static bool prefetch_wait_for(uint64 ring_index);
@@ -1005,6 +1008,12 @@ prefetch_do_request(PrefetchRequest *slot, neon_request_lsns *force_request_lsns
 		.rinfo = BufTagGetNRelFileInfo(slot->buftag),
 		.forknum = slot->buftag.forkNum,
 		.blkno = slot->buftag.blockNum,
+		.flags = (neon_protocol_version >= 4 &&
+				  neon_cxl_cache_enabled &&
+				  neon_cxl_cache_file != NULL &&
+				  neon_cxl_cache_file[0] != '\0' &&
+				  !(slot->flags & PRFSF_NO_SHARED))
+			? NEON_GETPAGE_FLAG_ALLOW_SHARED : 0,
 	};
 
 	Assert(mySlotNo == MyPState->ring_unused);
@@ -1146,7 +1155,7 @@ communicator_prefetch_register_bufferv(BufferTag tag, neon_request_lsns *frlsns,
 {
 	uint64		ring_index PG_USED_FOR_ASSERTS_ONLY;
 
-	ring_index = prefetch_register_bufferv(tag, frlsns, nblocks, mask, true);
+	ring_index = prefetch_register_bufferv(tag, frlsns, nblocks, mask, true, true);
 
 	Assert(ring_index < MyPState->ring_unused &&
 		   MyPState->ring_last <= ring_index);
@@ -1158,7 +1167,7 @@ communicator_prefetch_register_bufferv(BufferTag tag, neon_request_lsns *frlsns,
 static uint64
 prefetch_register_bufferv(BufferTag tag, neon_request_lsns *frlsns,
 						  BlockNumber nblocks, const bits8 *mask,
-						  bool is_prefetch)
+						  bool is_prefetch, bool allow_shared)
 {
 	uint64		last_ring_index;
 	PrefetchRequest hashkey;
@@ -1359,7 +1368,7 @@ Retry:
 		slot->buftag = hashkey.buftag;
 		slot->shard_no = get_shard_number(&tag);
 		slot->my_ring_index = last_ring_index;
-		slot->flags = 0;
+		slot->flags = allow_shared ? 0 : PRFSF_NO_SHARED;
 
 		if (is_prefetch)
 			MyNeonCounters->getpage_prefetch_requests_total++;
@@ -1537,6 +1546,8 @@ nm_pack_request(NeonRequest *msg)
 				pq_sendint32(&s, NInfoGetRelNumber(msg_req->rinfo));
 				pq_sendbyte(&s, msg_req->forknum);
 				pq_sendint32(&s, msg_req->blkno);
+				if (neon_protocol_version >= 4)
+					pq_sendbyte(&s, msg_req->flags);
 
 				break;
 			}
@@ -1555,6 +1566,7 @@ nm_pack_request(NeonRequest *msg)
 		case T_NeonExistsResponse:
 		case T_NeonNblocksResponse:
 		case T_NeonGetPageResponse:
+		case T_NeonGetPageSharedResponse:
 		case T_NeonErrorResponse:
 		case T_NeonDbSizeResponse:
 		case T_NeonGetSlruSegmentResponse:
@@ -1632,6 +1644,8 @@ nm_unpack_response(StringInfo s)
 					NInfoGetRelNumber(msg_resp->req.rinfo) = pq_getmsgint(s, 4);
 					msg_resp->req.forknum = pq_getmsgbyte(s);
 					msg_resp->req.blkno = pq_getmsgint(s, 4);
+					if (neon_protocol_version >= 4)
+						msg_resp->req.flags = pq_getmsgbyte(s);
 				}
 				msg_resp->req.hdr = resp_hdr;
 				/* XXX:	should be varlena */
@@ -1641,6 +1655,70 @@ nm_unpack_response(StringInfo s)
 				Assert(msg_resp->req.hdr.tag == T_NeonGetPageResponse);
 
 				resp = (NeonResponse *) msg_resp;
+				break;
+			}
+
+		case T_NeonGetPageSharedResponse:
+			{
+				NeonGetPageRequest req = {0};
+				NeonCxlPageLocation location = {0};
+				NeonGetPageResponse *page_resp;
+				char	   *failure_reason = NULL;
+
+				if (neon_protocol_version < 4)
+					ereport(ERROR,
+							(errcode(ERRCODE_PROTOCOL_VIOLATION),
+							 errmsg(NEON_TAG "received shared-page response before pagestream V4")));
+
+				NInfoGetSpcOid(req.rinfo) = pq_getmsgint(s, 4);
+				NInfoGetDbOid(req.rinfo) = pq_getmsgint(s, 4);
+				NInfoGetRelNumber(req.rinfo) = pq_getmsgint(s, 4);
+				req.forknum = pq_getmsgbyte(s);
+				req.blkno = pq_getmsgint(s, 4);
+				req.flags = pq_getmsgbyte(s);
+				memcpy(location.pool_uuid, pq_getmsgbytes(s, 16), 16);
+				location.pool_epoch = pq_getmsgint64(s);
+				location.region_id = pq_getmsgint(s, 4);
+				location.region_epoch = pq_getmsgint64(s);
+				location.slot_id = pq_getmsgint64(s);
+				location.expected_control = pq_getmsgint64(s);
+				location.absolute_offset = pq_getmsgint64(s);
+				location.length = pq_getmsgint(s, 4);
+				location.checksum_crc32c = pq_getmsgint(s, 4);
+				pq_getmsgend(s);
+				req.hdr = resp_hdr;
+
+				page_resp = MemoryContextAllocZero(MyPState->bufctx,
+												  PS_GETPAGERESPONSE_SIZE);
+				page_resp->req = req;
+				if (neon_cxl_cache_read(&location, page_resp->page,
+										&failure_reason))
+				{
+					elog(DEBUG1,
+						 NEON_TAG "CXL cache hit: region=%u epoch=" UINT64_FORMAT
+						 " slot=" UINT64_FORMAT " control=" UINT64_FORMAT,
+						 location.region_id, location.region_epoch,
+						 location.slot_id, location.expected_control);
+					page_resp->req.hdr.tag = T_NeonGetPageResponse;
+					resp = (NeonResponse *) page_resp;
+				}
+				else
+				{
+					NeonErrorResponse *error_resp;
+					size_t		prefix_len = strlen(NEON_CXL_FALLBACK_PREFIX);
+					size_t		reason_len = strlen(failure_reason);
+
+					pfree(page_resp);
+					error_resp = MemoryContextAllocZero(
+						MyPState->bufctx,
+						sizeof(NeonErrorResponse) + prefix_len + reason_len + 1);
+					error_resp->req = resp_hdr;
+					memcpy(error_resp->message, NEON_CXL_FALLBACK_PREFIX, prefix_len);
+					memcpy(error_resp->message + prefix_len, failure_reason,
+						   reason_len + 1);
+					error_resp->req.tag = T_NeonErrorResponse;
+					resp = (NeonResponse *) error_resp;
+				}
 				break;
 			}
 
@@ -2128,7 +2206,8 @@ communicator_read_at_lsnv(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber ba
 	 * weren't for the behaviour of the LwLsn cache that uses the highest
 	 * value of the LwLsn cache when the entry is not found.
 	 */
-	(void) prefetch_register_bufferv(hashkey.buftag, request_lsns, nblocks, mask, false);
+	(void) prefetch_register_bufferv(hashkey.buftag, request_lsns, nblocks, mask,
+									false, true);
 
 	for (int i = 0; i < nblocks; i++)
 	{
@@ -2136,6 +2215,7 @@ communicator_read_at_lsnv(NRelFileInfo rinfo, ForkNumber forkNum, BlockNumber ba
 		BlockNumber blockno = base_blockno + i;
 		neon_request_lsns *reqlsns = &request_lsns[i];
 		TimestampTz		start_ts, end_ts;
+		bool		allow_shared = true;
 
 		if (PointerIsValid(mask) && BITMAP_ISSET(mask, i))
 			continue;
@@ -2187,7 +2267,8 @@ Retry:
 		{
 			if (entry == NULL)
 			{
-				ring_index = prefetch_register_bufferv(hashkey.buftag, reqlsns, 1, NULL, false);
+				ring_index = prefetch_register_bufferv(hashkey.buftag, reqlsns, 1,
+													  NULL, false, allow_shared);
 				Assert(ring_index != UINT64_MAX);
 				slot = GetPrfSlot(ring_index);
 			}
@@ -2235,6 +2316,20 @@ Retry:
 				break;
 			}
 			case T_NeonErrorResponse:
+				if (strncmp(((NeonErrorResponse *) resp)->message,
+							NEON_CXL_FALLBACK_PREFIX,
+							strlen(NEON_CXL_FALLBACK_PREFIX)) == 0)
+				{
+					neon_shard_log(slot->shard_no, DEBUG1,
+								   "CXL cache read failed for block %u in rel %u/%u/%u.%u; retrying through pagestream: %s",
+								   blockno, RelFileInfoFmt(rinfo), forkNum,
+								   ((NeonErrorResponse *) resp)->message +
+								   strlen(NEON_CXL_FALLBACK_PREFIX));
+					prefetch_set_unused(ring_index);
+					prefetch_cleanup_trailing_unused();
+					allow_shared = false;
+					goto Retry;
+				}
 				ereport(ERROR,
 						(errcode(ERRCODE_IO_ERROR),
 						 errmsg(NEON_TAG "[shard %d, reqid " UINT64_HEX_FORMAT "] could not read block %u in rel %u/%u/%u.%u from page server at lsn %X/%08X",

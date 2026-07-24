@@ -607,6 +607,7 @@ impl Client for LibpqClient {
                 },
                 rel,
                 blkno,
+                flags: 0,
             };
             self.inner.getpage_send(req).await?;
         }

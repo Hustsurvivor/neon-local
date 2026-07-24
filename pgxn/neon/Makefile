@@ -6,6 +6,7 @@ OBJS = \
 	$(WIN32RES) \
 	communicator.o \
 	communicator_process.o \
+	cxl_cache.o \
 	extension_server.o \
 	file_cache.o \
 	hll.o \

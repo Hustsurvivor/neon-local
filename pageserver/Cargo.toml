@@ -50,6 +50,7 @@ itertools.workspace = true
 jsonwebtoken.workspace = true
 md5.workspace = true
 metrics.workspace = true
+neon-cxl-cache.workspace = true
 nix.workspace = true
 num_cpus.workspace = true # hack to get the number of worker threads tokio uses
 num-traits.workspace = true
