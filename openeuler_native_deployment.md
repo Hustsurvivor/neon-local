@@ -237,22 +237,24 @@ cmake --version
 
 ```bash
 cd /workspace
-git clone --recurse-submodules \
+git clone \
+  --depth 1 \
+  --single-branch \
   --branch cxl-cache \
+  --recurse-submodules \
+  --shallow-submodules \
+  --jobs 1 \
   git@github.com:Hustsurvivor/neon-local.git neon
 
 cd /workspace/neon
-git checkout a33ae4a
-git submodule update --init --recursive
+git submodule sync --recursive
+git submodule update --init --recursive --depth 1 --jobs 1
 ```
 
-`a33ae4a` 包含当前 CXL Cache 实现和基准测试方案。部署时固定到明确提交，避免
-构建期间远程分支发生变化。
-
-验证：
+记录实际部署的提交，后续升级和回退都使用明确 SHA：
 
 ```bash
-git rev-parse --short HEAD
+git rev-parse HEAD
 git status --short
 ```
 
@@ -260,10 +262,69 @@ git status --short
 
 ```bash
 cd /workspace
-git clone --recurse-submodules \
+git clone \
+  --depth 1 \
+  --single-branch \
   --branch cxl-cache \
+  --recurse-submodules \
+  --shallow-submodules \
+  --jobs 1 \
   https://github.com/Hustsurvivor/neon-local.git neon
 ```
+
+浅拉取只省略 Git 历史。四个固定版本当前提交所对应的源码仍会下载，因为
+`postgres_ffi` 编译时需要 PostgreSQL 14、15、16 和 17 的头文件。
+
+已有仓库更新到浅拉取配置：
+
+```bash
+cd /workspace/neon
+git pull --ff-only
+git submodule sync --recursive
+git submodule update \
+  --init \
+  --recursive \
+  --depth 1 \
+  --jobs 1
+```
+
+之前失败留下的部分下载可以继续复用，不需要先删除子模块目录。
+
+如果 GitHub 拒绝以 depth 1 直接取得某个固定提交，只对失败版本执行精确拉取：
+
+```bash
+git -C vendor/postgres-v14 fetch --depth 1 origin \
+  2155cb165d05f617eb2c8ad7e43367189b627703
+
+git -C vendor/postgres-v15 fetch --depth 1 origin \
+  2aaab3bb4a13557aae05bb2ae0ef0a132d0c4f85
+
+git -C vendor/postgres-v16 fetch --depth 1 origin \
+  a42351fcd41ea01edede1daed65f651e838988fc
+
+git -C vendor/postgres-v17 fetch --depth 1 origin \
+  1e01fcea2a6b38180021aa83e0051d95286d9096
+
+git submodule update --init --recursive --jobs 1
+```
+
+验证 URL、浅拉取配置和子模块状态：
+
+```bash
+git config --file .gitmodules \
+  --get-regexp '^submodule\..*\.(url|shallow)$'
+
+for pg in 14 15 16 17; do
+  git -C "vendor/postgres-v${pg}" \
+    rev-parse --is-shallow-repository
+done
+
+git submodule status
+```
+
+四个 `rev-parse` 命令都应输出 `true`，`git submodule status` 不应出现以 `-`
+或 `+` 开头的条目。不要使用 `--remote` 或在子模块内执行 `git pull`，否则可能
+偏离主仓库固定的提交。
 
 首次部署不从 Docker 命名卷复制 `.neon`，而是在 openEuler 上重新初始化环境。
 
