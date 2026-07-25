@@ -229,6 +229,10 @@ cmake --version
 
 ## 7. 拉取源码
 
+四个 PostgreSQL 子模块固定从 Neon 官方仓库
+`https://github.com/neondatabase/postgres.git` 拉取。主仓库位于个人 GitHub
+命名空间不会改变子模块来源，也不需要创建 `Hustsurvivor/postgres` 仓库。
+
 使用 SSH 拉取当前远程分支：
 
 ```bash
